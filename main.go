@@ -41,11 +41,12 @@ func main() {
 	}
 
 	d := &comp{
-		client:    client,
-		waSocket:  settings.WhatsApp.Socket,
-		waEnabled: settings.WhatsApp.Enabled,
-		agents:    agents,
-		errands:   map[string]*Errand{},
+		client:     client,
+		waSocket:   settings.WhatsApp.Socket,
+		waEnabled:  settings.WhatsApp.Enabled,
+		agents:     agents,
+		errands:    map[string]*Errand{},
+		interviews: map[int64]*interview{},
 	}
 
 	// Resolve the owner chat (where errands report back). Retry briefly in case
@@ -79,6 +80,10 @@ func main() {
 func (d *comp) runTGSubscribe() {
 	for {
 		err := d.client.Subscribe("errands", func(ev ipc.Event) {
+			// A standup interview owns the chat first, if one is active.
+			if d.feedInterview(ev.ChatID, ev.Text) {
+				return
+			}
 			e := d.activeErrandForTG(ev.ChatID)
 			if e == nil {
 				return
@@ -171,7 +176,8 @@ func (d *comp) hasActiveWAErrand() bool {
 // --- command socket (errands.sock) ------------------------------------------
 
 type cmdRequest struct {
-	Text string `json:"text"` // a full "errand …" command line
+	Text      string         `json:"text"`                // a full "errand …" command line
+	Interview *InterviewSpec `json:"interview,omitempty"` // a standup interview to conduct (from zc-team)
 }
 
 type cmdResponse struct {
@@ -216,6 +222,11 @@ func serveCommands(d *comp) {
 			var req cmdRequest
 			if json.Unmarshal(line, &req) != nil {
 				writeCmd(c, cmdResponse{Error: "bad request"})
+				return
+			}
+			if req.Interview != nil {
+				go d.runInterview(*req.Interview) // conducts + posts result to team.sock
+				writeCmd(c, cmdResponse{OK: true})
 				return
 			}
 			writeCmd(c, cmdResponse{OK: true, Reply: d.handleErrandCommand(req.Text)})

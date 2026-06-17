@@ -24,8 +24,9 @@ type comp struct {
 	ownerChat int64
 	agents    agent.AgentConfig
 
-	mu      sync.Mutex
-	errands map[string]*Errand
+	mu         sync.Mutex
+	errands    map[string]*Errand
+	interviews map[int64]*interview // standup interviews in flight, keyed by chat
 }
 
 // --- IO the ported errand logic calls (TG via IPC, WA via the sidecar) -------
@@ -65,6 +66,9 @@ func (d *comp) syncClaims() {
 		} else {
 			c.TG = append(c.TG, e.TGChat)
 		}
+	}
+	for cid := range d.interviews {
+		c.TG = append(c.TG, cid) // standup interviews claim the staff member's chat
 	}
 	d.mu.Unlock()
 	_ = agent.SaveClaims(c)
