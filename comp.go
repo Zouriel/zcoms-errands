@@ -26,7 +26,8 @@ type comp struct {
 
 	mu         sync.Mutex
 	errands    map[string]*Errand
-	interviews map[int64]*interview // standup interviews in flight, keyed by chat
+	interviews map[int64]*interview        // standup interviews in flight, keyed by chat
+	scheduled  map[string]*ScheduledErrand // errands queued to fire at a future time, by id
 }
 
 // --- IO the ported errand logic calls (TG via IPC, WA via the sidecar) -------
@@ -106,12 +107,16 @@ func (d *comp) startErrand(spec ErrandSpec) (string, error) {
 	if err := d.resolveErrandTarget(e, spec.Target); err != nil {
 		return "", err
 	}
+	e.ContextFiles = d.errandContextFiles(e)
 	d.mu.Lock()
 	d.errands[e.ID] = e
 	d.mu.Unlock()
 	if err := SaveErrand(e); err != nil {
 		return "", fmt.Errorf("couldn't save errand: %w", err)
 	}
+	d.logErrand(e, errandLogLifecycle, "created", "target=%s platform=%s auto_start=%v deliver_to_target=%v brief=%q context_files=%v",
+		e.TargetName, e.platform(), e.AutoStart, e.DeliverToTarget, e.Brief, e.ContextFiles)
+	_ = SaveErrand(e)
 	d.syncClaims()
 	d.kickErrand(e)
 	verb := "Drafting a plan for your approval"
@@ -144,7 +149,7 @@ func (d *comp) resolveErrandTarget(e *Errand, target string) error {
 		return fmt.Errorf("no recipient #%d in the last triage batch", idx)
 	}
 	if strings.HasPrefix(target, "wa:") || strings.Contains(target, "@s.whatsapp.net") || strings.Contains(target, "@lid") {
-		jid := strings.TrimPrefix(target, "wa:")
+		jid := normalizeWAJID(strings.TrimPrefix(target, "wa:"))
 		e.Source, e.WAChat, e.TargetName = "wa", jid, jid
 		if batch, err := loadTriageBatch(); err == nil {
 			for _, r := range batch.Recipients {
@@ -162,6 +167,72 @@ func (d *comp) resolveErrandTarget(e *Errand, target string) error {
 	}
 	e.Source, e.TGChat, e.TargetName = "tg", chatID, target
 	return nil
+}
+
+func normalizeWAJID(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" || strings.Contains(target, "@") {
+		return target
+	}
+	return target + "@s.whatsapp.net"
+}
+
+func (d *comp) errandContextFiles(e *Errand) []string {
+	if e.Source != "wa" || strings.TrimSpace(e.WAChat) == "" {
+		return nil
+	}
+	files := waBufferedFiles(e.WAChat)
+	if len(files) > 5 {
+		files = files[len(files)-5:]
+	}
+	return files
+}
+
+func waBufferedFiles(jid string) []string {
+	dir, err := agent.DefaultAppDir()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "wa-store.json"))
+	if err != nil {
+		return nil
+	}
+	var raw struct {
+		Buffered []json.RawMessage `json:"buffered"`
+	}
+	if json.Unmarshal(data, &raw) != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var files []string
+	for _, pairData := range raw.Buffered {
+		var pair []json.RawMessage
+		if json.Unmarshal(pairData, &pair) != nil || len(pair) != 2 {
+			continue
+		}
+		var chat string
+		if json.Unmarshal(pair[0], &chat) != nil || chat != jid {
+			continue
+		}
+		var msgs []struct {
+			File string `json:"file"`
+		}
+		if json.Unmarshal(pair[1], &msgs) != nil {
+			continue
+		}
+		for _, msg := range msgs {
+			file := strings.TrimSpace(msg.File)
+			if file == "" || seen[file] {
+				continue
+			}
+			if _, err := os.Stat(file); err != nil {
+				continue
+			}
+			seen[file] = true
+			files = append(files, file)
+		}
+	}
+	return files
 }
 
 func (d *comp) pendingErrand(id string) *Errand {
@@ -193,6 +264,7 @@ func (d *comp) cancelErrand(id string) (*Errand, bool) {
 	}
 	d.mu.Unlock()
 	if ok {
+		d.logErrand(e, errandLogLifecycle, "cancelled", "cancelled by owner command")
 		_ = SaveErrand(e)
 		d.syncClaims()
 	}
@@ -267,11 +339,32 @@ func parseErrandStart(s string) (ErrandSpec, error) {
 func (d *comp) handleErrandCommand(text string) string {
 	fields := strings.Fields(text)
 	if len(fields) < 2 {
-		return d.errandListText() + "\n\nCommands: errand list · errand start [deliver] [go] <@user|wa:JID|#index> | <brief> · errand yes [id] · errand no [id] · errand edit [id] <changes> · errand cancel <id>"
+		return d.errandListText() + "\n\nCommands: errand list · errand start [deliver] [go] <@user|wa:JID|#index> | <brief> · errand schedule [deliver] [go] <target> at <time> | <brief> · errand scheduled · errand unschedule <id> · errand yes [id] · errand no [id] · errand edit [id] <changes> · errand cancel <id>"
 	}
 	switch strings.ToLower(fields[1]) {
 	case "list":
 		return d.errandListText()
+	case "schedule":
+		_, after, _ := strings.Cut(text, "schedule")
+		spec, runAt, err := parseErrandSchedule(after, time.Now())
+		if err != nil {
+			return "⚠️ " + err.Error()
+		}
+		msg, err := d.scheduleErrand(spec, runAt)
+		if err != nil {
+			return "⚠️ " + err.Error()
+		}
+		return msg
+	case "scheduled":
+		return d.scheduledListText()
+	case "unschedule":
+		if len(fields) < 3 {
+			return "Usage: errand unschedule <id>"
+		}
+		if d.unschedule(fields[2]) {
+			return "🗑 Cancelled scheduled errand " + fields[2] + "."
+		}
+		return "No scheduled errand with id " + fields[2] + "."
 	case "start":
 		_, after, _ := strings.Cut(text, "start")
 		spec, err := parseErrandStart(after)

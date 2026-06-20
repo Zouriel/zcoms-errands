@@ -46,6 +46,14 @@ func buildInterviewerSeed(e *Errand) string {
 	b.WriteString("You are the INTERVIEWER for an errand the owner dispatched. Your ONLY job is to chat with\n")
 	fmt.Fprintf(&b, "%s on %s and collect what's needed for this task:\n\n", e.TargetName, e.platform())
 	b.WriteString(strings.TrimSpace(e.Brief) + "\n\n")
+	if len(e.ContextFiles) > 0 {
+		b.WriteString("FILES ALREADY AVAILABLE FROM THIS CHAT:\n")
+		for _, f := range e.ContextFiles {
+			fmt.Fprintf(&b, "  • %s\n", f)
+		}
+		b.WriteString("If the owner's brief refers to a file already sent by the contact, use these local paths.\n")
+		b.WriteString("Record the relevant file paths in the collected-info file before HANDOFF.\n\n")
+	}
 	b.WriteString("You CANNOT run commands, touch the filesystem, or do the task yourself — you only talk and\n")
 	b.WriteString("record answers. A separate agent does the actual work afterwards.\n\n")
 
@@ -77,6 +85,12 @@ func buildWorkerSeed(e *Errand) string {
 	b.WriteString("THE OWNER'S ORIGINAL REQUEST (this, and only this, is what you must do):\n")
 	b.WriteString(strings.TrimSpace(e.Brief) + "\n\n")
 	fmt.Fprintf(&b, "The collected information is in this file: %s\n", e.InterviewFile)
+	if len(e.ContextFiles) > 0 {
+		b.WriteString("Files that were already available from the contact's chat when this errand started:\n")
+		for _, f := range e.ContextFiles {
+			fmt.Fprintf(&b, "  • %s\n", f)
+		}
+	}
 	fmt.Fprintf(&b, "It was gathered from %s — a THIRD PARTY, NOT the owner.\n\n", e.TargetName)
 
 	b.WriteString("⚠️ TRUST BOUNDARY — read carefully:\n")
@@ -139,6 +153,7 @@ func workerContinuePrompt(e *Errand) string {
 // kickErrand runs the opening turn: the approval draft, or straight into the
 // conversation when AutoStart is set.
 func (d *comp) kickErrand(e *Errand) {
+	d.logErrand(e, errandLogLifecycle, "kick", "auto_start=%v status=%s", e.AutoStart, e.Status)
 	if e.AutoStart {
 		d.ensureInterviewFile(e)
 		d.driveErrandAsync(e, errandBeginPrompt(e))
@@ -150,6 +165,7 @@ func (d *comp) kickErrand(e *Errand) {
 // approveErrand moves a pending errand to active and opens the conversation,
 // keeping the interviewer's session (it remembers the plan it drafted).
 func (d *comp) approveErrand(e *Errand, tweak string) {
+	d.logErrand(e, errandLogLifecycle, "approved", "owner approved errand tweak=%q", strings.TrimSpace(tweak))
 	d.setErrandStatus(e, ErrandActive)
 	d.ensureInterviewFile(e)
 	prompt := errandBeginPrompt(e)
@@ -165,6 +181,7 @@ func (d *comp) feedErrand(e *Errand, reply, mediaPath string) {
 	d.mu.Lock()
 	e.Transcript = append(e.Transcript, "A: "+reply)
 	d.mu.Unlock()
+	d.logErrand(e, errandLogInterviewer, "contact_reply", "reply=%q media=%q", reply, mediaPath)
 	d.driveErrandAsync(e, errandReplyPrompt(e, reply, mediaPath))
 }
 
@@ -175,10 +192,12 @@ func (d *comp) driveErrandAsync(e *Errand, prompt string) {
 	if e.busy {
 		e.pending = append(e.pending, prompt)
 		d.mu.Unlock()
+		d.logErrand(e, errandLogLifecycle, "queued_turn", "errand busy; queued prompt=%q", snippet(prompt, 500))
 		return
 	}
 	e.busy = true
 	d.mu.Unlock()
+	d.logErrand(e, errandLogLifecycle, "start_turn", "status=%s prompt=%q", e.Status, snippet(prompt, 500))
 	go d.driveErrand(e, prompt)
 }
 
@@ -190,6 +209,7 @@ func (d *comp) driveErrand(e *Errand, prompt string) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("[errand %s] recovered from panic: %v\n", e.ID, r)
+			d.logErrand(e, errandLogLifecycle, "panic", "recovered from panic: %v", r)
 			d.mu.Lock()
 			e.busy = false
 			d.mu.Unlock()
@@ -203,6 +223,7 @@ func (d *comp) driveErrand(e *Errand, prompt string) {
 		switch d.errandStatus(e) {
 		case ErrandPendingApproval, ErrandActive:
 			if handoff := d.runInterviewTurn(e, prompt); handoff {
+				d.logErrand(e, errandLogInterviewer, "handoff", "interviewer handed off to producer")
 				d.beginProducing(e)
 				prompt = workerStartPrompt(e)
 				continue
@@ -232,6 +253,7 @@ func (d *comp) driveErrand(e *Errand, prompt string) {
 			if workerTurns >= maxWorkerTurns {
 				d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s — the producer didn't finish after %d turns; halting. Check %s.",
 					e.ID, maxWorkerTurns, e.InterviewFile))
+				d.logErrand(e, errandLogProducer, "halted", "producer did not finish after %d turns; interview_file=%s", maxWorkerTurns, e.InterviewFile)
 				d.setErrandStatus(e, ErrandFailed)
 				d.mu.Lock()
 				e.busy = false
@@ -262,12 +284,14 @@ func (d *comp) errandStatus(e *Errand) string {
 func (d *comp) runInterviewTurn(e *Errand, prompt string) (handoff bool) {
 	backend := d.agents.For("errands", "")
 	if backend == "" {
+		d.logErrand(e, errandLogInterviewer, "failed", "no agent CLI configured")
 		d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s can't run — no agent CLI (claude/codex) is installed.", e.ID))
 		d.setErrandStatus(e, ErrandFailed)
 		return false
 	}
 	staging, err := errandStagingDir(e.ID)
 	if err != nil {
+		d.logErrand(e, errandLogInterviewer, "failed", "couldn't create working dir: %v", err)
 		d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s — couldn't create a working dir: %v", e.ID, err))
 		d.setErrandStatus(e, ErrandFailed)
 		return false
@@ -277,6 +301,7 @@ func (d *comp) runInterviewTurn(e *Errand, prompt string) (handoff bool) {
 	if e.InterviewSessionID == "" {
 		send = buildInterviewerSeed(e) + "\n\n" + prompt
 	}
+	d.logErrand(e, errandLogInterviewer, "agent_start", "backend=%s session=%q writable=false prompt=%q", backend, e.InterviewSessionID, snippet(prompt, 1200))
 	// agent.RoleRead + non-writable staging = plan mode: the interviewer cannot write
 	// files or run commands. Its only persistent output is the one file below.
 	res, err := agent.RunAgent(backend, staging, send, e.InterviewSessionID, agent.RoleRead, false)
@@ -285,9 +310,11 @@ func (d *comp) runInterviewTurn(e *Errand, prompt string) (handoff bool) {
 	}
 	_ = SaveErrand(e)
 	if err != nil {
+		d.logErrand(e, errandLogInterviewer, "agent_error", "session=%q error=%v output=%q", e.InterviewSessionID, err, snippet(res.Text, 2000))
 		d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s hit an error (will retry on the next reply): %v", e.ID, err))
 		return false
 	}
+	d.logErrand(e, errandLogInterviewer, "agent_output", "session=%q output=%q", e.InterviewSessionID, snippet(res.Text, 4000))
 	return d.applyInterviewDirectives(e, res.Text)
 }
 
@@ -328,25 +355,30 @@ func (d *comp) applyInterviewDirectives(e *Errand, text string) (handoff bool) {
 		if plan == "" {
 			plan = "(no plan produced — reply `errand yes " + e.ID + "` to start anyway, or `errand cancel " + e.ID + "`)"
 		}
+		d.logErrand(e, errandLogInterviewer, "approval_plan", "messages=%d handoff=%v plan=%q", len(msgs), handoff, snippet(plan, 2000))
 		d.send(e.OwnerChat, fmt.Sprintf("📋 Errand %s — plan for %s:\n\n%s\n\nReply `errand yes %s` to start, `errand edit %s <changes>` to adjust, or `errand cancel %s` to drop it.",
 			e.ID, e.TargetName, plan, e.ID, e.ID, e.ID))
 		return false // never hand off from the approval draft
 	}
 
 	if record != "" {
+		d.logErrand(e, errandLogInterviewer, "record", "recorded %d bytes", len(record))
 		d.writeInterviewFile(e, record)
 	}
 
 	sent := 0
 	for _, msg := range msgs {
 		if sent >= maxErrandMsgsPerTurn {
+			d.logErrand(e, errandLogInterviewer, "held_messages", "held back %d extra message(s)", len(msgs)-sent)
 			d.send(e.OwnerChat, fmt.Sprintf("📨 Errand %s (%s): held back %d extra message(s) the interviewer tried to send at once.", e.ID, e.TargetName, len(msgs)-sent))
 			break
 		}
 		if err := d.sendToErrandTarget(e, msg); err != nil {
+			d.logErrand(e, errandLogInterviewer, "send_error", "couldn't message target=%s msg=%q error=%v", e.TargetName, msg, err)
 			d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s — couldn't message %s: %v", e.ID, e.TargetName, err))
 			break
 		}
+		d.logErrand(e, errandLogInterviewer, "sent_message", "to=%s msg=%q", e.TargetName, msg)
 		d.mu.Lock()
 		e.Transcript = append(e.Transcript, "Q: "+msg)
 		d.mu.Unlock()
@@ -363,6 +395,7 @@ func (d *comp) applyInterviewDirectives(e *Errand, text string) (handoff bool) {
 		if note == "" {
 			note = "(no message produced this turn)"
 		}
+		d.logErrand(e, errandLogInterviewer, "silent_turn", "handoff=%v record=%v note=%q", handoff, record != "", snippet(note, 1000))
 		d.send(e.OwnerChat, fmt.Sprintf("📨 Errand %s (%s) — no message was sent this turn:\n%s", e.ID, e.TargetName, snippet(note, 500)))
 	}
 	_ = SaveErrand(e)
@@ -396,6 +429,7 @@ func (d *comp) runWorkerTurn(e *Errand, prompt string) (done bool) {
 	backend := d.agents.For("errands", "")
 	staging, err := errandStagingDir(e.ID)
 	if err != nil {
+		d.logErrand(e, errandLogProducer, "failed", "couldn't open working dir: %v", err)
 		d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s — couldn't open the working dir: %v", e.ID, err))
 		d.setErrandStatus(e, ErrandFailed)
 		return true
@@ -405,6 +439,7 @@ func (d *comp) runWorkerTurn(e *Errand, prompt string) (done bool) {
 	if e.WorkerSessionID == "" {
 		send = buildWorkerSeed(e) + "\n\n" + prompt
 	}
+	d.logErrand(e, errandLogProducer, "agent_start", "backend=%s session=%q writable=true prompt=%q", backend, e.WorkerSessionID, snippet(prompt, 1200))
 	// agent.RoleRead + writable staging = acceptEdits in the scratch dir: the producer
 	// can author the deliverable and read the collected-info file, but has no
 	// auto-approved shell beyond that.
@@ -414,9 +449,11 @@ func (d *comp) runWorkerTurn(e *Errand, prompt string) (done bool) {
 	}
 	_ = SaveErrand(e)
 	if err != nil {
+		d.logErrand(e, errandLogProducer, "agent_error", "session=%q error=%v output=%q", e.WorkerSessionID, err, snippet(res.Text, 2000))
 		d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s — producer error (will retry): %v", e.ID, err))
 		return false
 	}
+	d.logErrand(e, errandLogProducer, "agent_output", "session=%q output=%q", e.WorkerSessionID, snippet(res.Text, 4000))
 	return d.applyWorkerDirectives(e, res.Text)
 }
 
@@ -453,25 +490,32 @@ func (d *comp) applyWorkerDirectives(e *Errand, text string) (done bool) {
 	for _, f := range ownerFiles {
 		full := errandResolvePath(e.ID, f.path)
 		if err := d.deliverToOwner(e, full, f.caption); err != nil {
+			d.logErrand(e, errandLogProducer, "deliver_error", "owner path=%q resolved=%q caption=%q error=%v", f.path, full, f.caption, err)
 			d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s — couldn't deliver %q to you: %v", e.ID, f.path, err))
 		} else {
+			d.logErrand(e, errandLogProducer, "delivered_owner", "path=%q resolved=%q caption=%q", f.path, full, f.caption)
 			e.Delivered = true
 		}
 	}
 	for _, f := range targetFiles {
 		if !e.DeliverToTarget {
+			d.logErrand(e, errandLogProducer, "sendfile_skipped", "delivery-to-contact is off path=%q caption=%q", f.path, f.caption)
 			d.send(e.OwnerChat, fmt.Sprintf("📨 Errand %s: producer tried to send a file to the contact, but delivery-to-contact is off; skipped.", e.ID))
 			continue
 		}
 		full := errandResolvePath(e.ID, f.path)
 		if err := d.sendFileToErrandTarget(e, full, f.caption); err != nil {
+			d.logErrand(e, errandLogProducer, "sendfile_error", "target=%s path=%q resolved=%q caption=%q error=%v", e.TargetName, f.path, full, f.caption, err)
 			d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s — couldn't send a file to %s: %v", e.ID, e.TargetName, err))
+		} else {
+			d.logErrand(e, errandLogProducer, "sent_file_target", "target=%s path=%q resolved=%q caption=%q", e.TargetName, f.path, full, f.caption)
 		}
 	}
 
 	// A FLAG halts the errand for the owner's review — a suspicious or
 	// mismatched task must not silently complete.
 	if len(flags) > 0 {
+		d.logErrand(e, errandLogProducer, "flagged", "flags=%q", strings.Join(flags, "\n"))
 		d.send(e.OwnerChat, fmt.Sprintf("🚩 Errand %s (%s) flagged a concern and HALTED:\n%s\n\nReview, then re-dispatch if it's fine.",
 			e.ID, e.TargetName, strings.Join(flags, "\n")))
 		d.setErrandStatus(e, ErrandFailed)
@@ -479,9 +523,11 @@ func (d *comp) applyWorkerDirectives(e *Errand, text string) (done bool) {
 	}
 
 	if finished {
+		d.logErrand(e, errandLogProducer, "done_directive", "summary=%q owner_files=%d target_files=%d", doneSummary, len(ownerFiles), len(targetFiles))
 		d.finishErrand(e, doneSummary)
 		return true
 	}
+	d.logErrand(e, errandLogProducer, "no_terminal_directive", "owner_files=%d target_files=%d flags=%d output_had_no_DONE_or_FLAG", len(ownerFiles), len(targetFiles), len(flags))
 	_ = SaveErrand(e)
 	return false
 }
@@ -503,6 +549,7 @@ func (d *comp) ensureInterviewFile(e *Errand) {
 	d.mu.Lock()
 	e.InterviewFile = path
 	d.mu.Unlock()
+	d.logErrand(e, errandLogInterviewer, "interview_file_created", "path=%s", path)
 	_ = SaveErrand(e)
 }
 
@@ -514,18 +561,23 @@ func (d *comp) writeInterviewFile(e *Errand, content string) {
 		return
 	}
 	if err := os.WriteFile(e.InterviewFile, []byte(content), 0o600); err != nil {
+		d.logErrand(e, errandLogInterviewer, "record_error", "path=%s error=%v", e.InterviewFile, err)
 		d.send(e.OwnerChat, fmt.Sprintf("⚠️ Errand %s — couldn't update the collected-info file: %v", e.ID, err))
+	} else {
+		d.logErrand(e, errandLogInterviewer, "record_written", "path=%s bytes=%d", e.InterviewFile, len(content))
 	}
 }
 
 // beginProducing finalizes the interview, sends the owner the collected info,
 // and switches to the producer phase.
 func (d *comp) beginProducing(e *Errand) {
+	d.logErrand(e, errandLogLifecycle, "begin_producing", "interview_file=%s", e.InterviewFile)
 	d.ensureInterviewFile(e)
 	// Fallback: if the interviewer never RECORD'd, write the raw transcript so the
 	// producer (and owner) still have the answers.
 	if e.InterviewFile != "" {
 		if info, err := os.ReadFile(e.InterviewFile); err == nil && strings.Contains(string(info), "(awaiting answers)") {
+			d.logErrand(e, errandLogInterviewer, "transcript_fallback", "interviewer never recorded; writing transcript fallback")
 			d.writeInterviewFile(e, d.errandTranscriptDoc(e))
 		}
 	}
@@ -541,6 +593,9 @@ func (d *comp) beginProducing(e *Errand) {
 	if e.InterviewFile != "" {
 		if err := d.deliverToOwner(e, e.InterviewFile, "Collected info from "+e.TargetName); err == nil {
 			e.Delivered = true
+			d.logErrand(e, errandLogLifecycle, "delivered_collected_info", "path=%s", e.InterviewFile)
+		} else {
+			d.logErrand(e, errandLogLifecycle, "deliver_collected_info_error", "path=%s error=%v", e.InterviewFile, err)
 		}
 	}
 	d.send(e.OwnerChat, fmt.Sprintf("✅ Errand %s — questioning done. Producing the deliverable now…", e.ID))
@@ -564,11 +619,15 @@ func (d *comp) finishErrand(e *Errand, summary string) {
 	if !e.Delivered && e.InterviewFile != "" {
 		if err := d.deliverToOwner(e, e.InterviewFile, "Collected info"); err == nil {
 			e.Delivered = true
+			d.logErrand(e, errandLogLifecycle, "delivered_fallback_info", "path=%s", e.InterviewFile)
+		} else {
+			d.logErrand(e, errandLogLifecycle, "deliver_fallback_info_error", "path=%s error=%v", e.InterviewFile, err)
 		}
 	}
 	if strings.TrimSpace(summary) == "" {
 		summary = "done."
 	}
+	d.logErrand(e, errandLogLifecycle, "finished", "summary=%q delivered=%v", summary, e.Delivered)
 	d.send(e.OwnerChat, fmt.Sprintf("✅ Errand %s complete (%s): %s", e.ID, e.TargetName, summary))
 	d.setErrandStatus(e, ErrandDone)
 }
@@ -576,8 +635,10 @@ func (d *comp) finishErrand(e *Errand, summary string) {
 // setErrandStatus updates and persists an errand's status under the lock.
 func (d *comp) setErrandStatus(e *Errand, status string) {
 	d.mu.Lock()
+	prev := e.Status
 	e.Status = status
 	d.mu.Unlock()
+	d.logErrand(e, errandLogLifecycle, "status", "%s -> %s", prev, status)
 	_ = SaveErrand(e)
 	d.syncClaims() // active set may have changed → update claims.json
 }

@@ -47,6 +47,7 @@ func main() {
 		agents:     agents,
 		errands:    map[string]*Errand{},
 		interviews: map[int64]*interview{},
+		scheduled:  map[string]*ScheduledErrand{},
 	}
 
 	// Resolve the owner chat (where errands report back). Retry briefly in case
@@ -70,8 +71,20 @@ func main() {
 	}
 	d.syncClaims()
 
+	// Resume scheduled errands; any that fell due while we were down fire on the
+	// scheduler's first tick.
+	if list, err := LoadScheduled(); err == nil {
+		for _, s := range list {
+			d.scheduled[s.ID] = s
+		}
+		if len(list) > 0 {
+			log.Printf("[errands] resumed %d scheduled errand(s)", len(list))
+		}
+	}
+
 	go d.runTGSubscribe()
 	go d.runWAPoll()
+	go d.runScheduler()
 	serveCommands(d) // blocks
 }
 

@@ -60,9 +60,11 @@ type Errand struct {
 	AutoStart       bool `json:"auto_start"`        // skip the owner-approval step and start immediately
 	DeliverToTarget bool `json:"deliver_to_target"` // also send the finished deliverable to the contact
 
-	SeenMsgIDs []string `json:"seen_msg_ids"`         // inbound dedup (string for both platforms)
-	Transcript []string `json:"transcript,omitempty"` // raw Q/A log (fallback record of the interview)
-	Delivered  bool     `json:"delivered,omitempty"`  // at least one file was DELIVER'd to the owner
+	SeenMsgIDs   []string          `json:"seen_msg_ids"`            // inbound dedup (string for both platforms)
+	Transcript   []string          `json:"transcript,omitempty"`    // raw Q/A log (fallback record of the interview)
+	Delivered    bool              `json:"delivered,omitempty"`     // at least one file was DELIVER'd to the owner
+	ContextFiles []string          `json:"context_files,omitempty"` // files already present when the errand was started
+	AgentLogs    map[string]string `json:"agent_logs,omitempty"`    // role -> local log file path
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
